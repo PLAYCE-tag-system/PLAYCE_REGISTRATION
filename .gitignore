@@ -70,6 +70,8 @@ instance/
 # Scrapy stuff:
 .scrapy
 
+.harness\memory\debt-resolutions.jsonl
+
 # Sphinx documentation
 docs/_build/
 
