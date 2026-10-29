@@ -1,90 +1,24 @@
-# PLAYCE Registration
+# PLAYCE QR 등록 화면
 
-Registration-device code for Linux/Raspberry Pi.
+수신기가 직접 읽은 UHF RFID 태그를 등록 챌린지에 연결하고 QR 코드를 표시하는 소스입니다.
 
-This repository contains only the field registration station:
+## 파일
 
-- Python registration reader service
-- QR display web app
-- ESP32 UHF reader sketch
+- `registration_reader.py`: 태그 이벤트를 받아 등록 서버에 챌린지 요청
+- `qr-display/qr_server.py`: QR 화면용 웹 서버
+- `qr-display/qr.html`, `qr-display/fonts/`: QR 화면과 폰트
+- `.env.example`: 비밀 값이 없는 설정 예시
 
-The backend, admin page, Android app, and detection readers are separate deployments.
+## 필요한 서비스
 
-## Flow
+QR 코드는 태그 이벤트를 받기 위해 별도 [PLAYCE_READER_NETWORK 저장소](https://github.com/PLAYCE-tag-system/PLAYCE_READER_NETWORK)의 `pc/collector.py`가 `http://127.0.0.1:8765/`에서 실행 중이어야 합니다. 챌린지 발급에는 별도 등록 백엔드도 필요합니다. 등록 백엔드의 소스와 데이터베이스는 이 저장소에 없습니다.
 
-```text
-ESP32/UHF registration reader
-  -> registration_reader.py
-  -> Backend POST /internal/registration-challenges
-  -> qr-display/qr.html polls /v1/registration-challenges/current
-  -> PLAYCE app scans the QR from the profile/tag registration screen
-```
+## 실행
 
-`registration_reader.py` creates QR registration challenges only. It does not post detection scan events.
+1. `.env.example`을 `.env`로 복사하고 실제 등록 API 주소, 내부 토큰, QR 클레임 URL 스킴을 설정하세요. `.env`는 Git에서 제외됩니다.
+2. `python -m pip install -r qr-display/requirements.txt`로 QR 의존성을 설치하세요.
+3. 태그 수집기를 켠 상태에서 `python registration_reader.py`를 실행하세요.
+4. QR 서버를 켜기 전에 QR 서버 프로세스에도 같은 등록 API 주소를 설정하세요. 예: PowerShell에서 `$env:REGISTRATION_API_BASE = 'http://your-server:4300'`를 입력한 뒤 `python qr-display/qr_server.py`를 실행합니다.
+5. `http://127.0.0.1:5173/qr.html`을 여세요.
 
-## Raspberry Pi Setup
-
-```bash
-sudo apt update
-sudo apt install -y python3-venv python3-pip nodejs npm
-
-python3 -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-
-cp .env.example .env
-```
-
-Edit `.env` for the backend host and serial port.
-
-## Python Registration Reader
-
-ESP32 gateway mode is the default. In this mode the ESP32 sends text lines such as:
-
-```text
-TAG_DETECTED,E280F30200000000DE25E8CA,201
-```
-
-Run:
-
-```bash
-python registration_reader.py
-```
-
-For a direct UHF serial reader that expects the PC/Pi to send the inventory command, set:
-
-```bash
-REGISTRATION_SOURCE_MODE=direct
-```
-
-## QR Display
-
-```bash
-cd qr-display
-npm ci
-npm run dev -- --host 0.0.0.0
-```
-
-Open:
-
-```text
-http://<raspberry-pi-ip>:5173/qr.html
-```
-
-## ESP32 Firmware
-
-Upload `firmware/esp32_uhf_registration_reader/esp32_uhf_registration_reader.ino` with Arduino IDE.
-
-Expected serial output:
-
-```text
-RFID Reader Ready (ESP32).
-RFID command loop mode enabled.
-TAG_DETECTED,E280F30200000000DE25E8CA,201
-```
-
-## Environment
-
-See `.env.example`.
-
-Registration reader IDs use the `rp_*` prefix. The default is `rp_001`.
+실제 API 토큰, 태그 이력 및 로그는 포함하지 않았습니다.

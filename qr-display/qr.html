@@ -1,12 +1,185 @@
 <!doctype html>
 <html lang="ko">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>PLAYCE Registration QR</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/qr.jsx"></script>
-  </body>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#080b0c">
+  <title>PLAYCE 등록 QR</title>
+  <style>
+    @font-face { font-family: "Freesentation"; src: url("/fonts/Freesentation-9Black.woff2") format("woff2"); font-style: normal; font-weight: 900; font-display: swap; }
+    @font-face { font-family: "Paperlogy"; src: url("/fonts/Paperlogy-5Medium.woff2") format("woff2"); font-style: normal; font-weight: 500; font-display: swap; }
+    @font-face { font-family: "RIDIBatang"; src: url("/fonts/RIDIBatang.woff") format("woff"); font-style: normal; font-weight: 400; font-display: swap; }
+    :root { color-scheme: dark; font-family: "RIDIBatang", "Malgun Gothic", serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 28px; color: #f4f7f6; background: radial-gradient(ellipse at 50% 15%, #173b3b 0, #0b1718 38%, #070909 78%); }
+    main { width: min(100%, 570px); text-align: center; }
+    .brand { color: #6ed3c1; font-family: "Paperlogy", "Malgun Gothic", sans-serif; font-size: 13px; font-weight: 500; letter-spacing: .22em; }
+    h1 { margin: 12px 0 8px; font-family: "Freesentation", "Malgun Gothic", sans-serif; font-size: clamp(27px, 5vw, 38px); font-weight: 900; }
+    #status { min-height: 28px; margin: 0 0 24px; color: #a9b8b5; font-size: 16px; }
+    .qr-frame { min-height: 350px; display: grid; place-items: center; padding: 22px; border: 1px solid #314342; border-radius: 24px; background: #111a1a; box-shadow: 0 25px 90px #0008; }
+    #qr { display: none; width: min(100%, 400px); height: auto; aspect-ratio: 1; padding: 14px; border-radius: 10px; background: white; }
+    #placeholder { color: #657976; font-size: 17px; line-height: 1.7; }
+    .info { margin-top: 20px; padding: 16px; border: 1px solid #233231; border-radius: 14px; background: #101716; }
+    .label { color: #8da29e; font-family: "Paperlogy", "Malgun Gothic", sans-serif; font-size: 12px; font-weight: 500; letter-spacing: .08em; }
+    #epc { margin-top: 7px; overflow-wrap: anywhere; font: 700 clamp(15px, 3.7vw, 20px) ui-monospace, Consolas, monospace; }
+    #token { margin-top: 8px; color: #75dfb4; font: 600 15px ui-monospace, Consolas, monospace; }
+    .source { margin-top: 10px; color: #80918e; font-size: 12px; }
+    footer { margin-top: 18px; color: #697976; font-size: 12px; }
+    @media (max-width: 480px) { body { padding: 18px; } .qr-frame { min-height: 300px; padding: 14px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="brand">PLAYCE · REGISTRATION</div>
+    <h1>태그 등록 QR</h1>
+    <p id="status" role="status">수신기에서 직접 읽은 태그를 기다리는 중입니다.</p>
+    <section class="qr-frame" aria-live="polite">
+      <img id="qr" alt="태그 등록 QR 코드">
+      <div id="placeholder">수신기 리더기에 태그를 대 주세요.</div>
+    </section>
+    <section class="info">
+      <div class="label">직접 측정한 EPC</div>
+      <div id="epc">—</div>
+      <div id="token"></div>
+      <div class="source">LoRa로 전달된 다른 리더기의 태그는 QR에 표시하지 않습니다.</div>
+    </section>
+    <footer>태그별 EPC와 등록 토큰 연결은 브라우저를 닫아도 저장되어 다시 표시됩니다.</footer>
+  </main>
+  <script>
+    (() => {
+      const qr = document.querySelector("#qr");
+      const placeholder = document.querySelector("#placeholder");
+      const status = document.querySelector("#status");
+      const epcLabel = document.querySelector("#epc");
+      const tokenLabel = document.querySelector("#token");
+      let selected = null;
+      let queued = null;
+      let holdUntil = 0;
+      let lastDirectSeenAt = 0;
+      let retryAt = 0;
+      let shownChallengeKey = "";
+      const challengeCache = new Map();
+
+      function renderChallenge(challenge, expired = false) {
+        const key = `${challenge.epc}:${challenge.claimUrl}`;
+        if (key !== shownChallengeKey) {
+          shownChallengeKey = key;
+          qr.src = `/api/qr.svg?value=${encodeURIComponent(challenge.claimUrl)}`;
+          qr.style.display = "block";
+          placeholder.style.display = "none";
+          const match = challenge.claimUrl.match(/[?&]token=([^&]+)/i);
+          tokenLabel.textContent = match ? decodeURIComponent(match[1]) : "";
+        }
+        status.textContent = expired
+          ? "이 토큰의 유효기간이 끝났습니다. EPC 연결은 보존되어 있습니다."
+          : "이 EPC에 연결된 등록 QR입니다.";
+      }
+
+      function setWaiting(text) {
+        status.textContent = text;
+        qr.style.display = "none";
+        placeholder.style.display = "block";
+        placeholder.textContent = text;
+        tokenLabel.textContent = "";
+      }
+
+      function selectEpc(tag) {
+        selected = tag;
+        holdUntil = Date.now() + 10_000;
+        lastDirectSeenAt = Date.now();
+        retryAt = 0;
+        shownChallengeKey = "";
+        epcLabel.textContent = tag.epc;
+        setWaiting("이 EPC에 연결된 등록 토큰을 확인 중입니다…");
+        const cacheKey = `playce-token-for:${tag.epc}`;
+        const cached = challengeCache.get(tag.epc) || localStorage.getItem(cacheKey) || sessionStorage.getItem(cacheKey);
+        if (cached) {
+          try {
+            const challenge = typeof cached === "string" ? JSON.parse(cached) : cached;
+            if (challenge.epc === tag.epc && challenge.claimUrl) {
+              challengeCache.set(tag.epc, challenge);
+              renderChallenge(challenge, true);
+            }
+          } catch (_) { /* Ignore an invalid local cache entry. */ }
+        }
+      }
+
+      function clearSelection() {
+        selected = null;
+        queued = null;
+        holdUntil = 0;
+        lastDirectSeenAt = 0;
+        retryAt = 0;
+        shownChallengeKey = "";
+        qr.removeAttribute("src");
+        qr.style.display = "none";
+        placeholder.style.display = "block";
+        placeholder.textContent = "수신기 리더기에 태그를 대 주세요.";
+        status.textContent = "수신기에서 직접 읽은 태그를 기다리는 중입니다.";
+        epcLabel.textContent = "—";
+        tokenLabel.textContent = "";
+      }
+
+      async function updateChallenge() {
+        if (!selected || Date.now() < retryAt) return;
+        retryAt = Date.now() + 2000;
+        try {
+          const response = await fetch(`/api/challenge?epc=${encodeURIComponent(selected.epc)}`, { cache: "no-store" });
+          const data = await response.json();
+          if (selected.epc !== data.epc || !data.challenge) {
+            const cached = challengeCache.get(selected.epc);
+            if (cached) renderChallenge(cached, true);
+            else setWaiting("이 EPC의 등록 챌린지를 기다리는 중입니다…");
+            return;
+          }
+          const challenge = data.challenge;
+          if (challenge.epc !== selected.epc) return;
+          challengeCache.set(challenge.epc, challenge);
+          const cacheKey = `playce-token-for:${challenge.epc}`;
+          localStorage.setItem(cacheKey, JSON.stringify(challenge));
+          sessionStorage.setItem(cacheKey, JSON.stringify(challenge));
+          renderChallenge(challenge, challenge.expired);
+        } catch (_) {
+          setWaiting("등록 서버 연결을 확인하는 중입니다…");
+        }
+      }
+
+      async function poll() {
+        try {
+          const response = await fetch("/api/direct-tags", { cache: "no-store" });
+          const data = await response.json();
+          const directTags = Array.isArray(data.tags) ? data.tags : [];
+          const tag = directTags[0];
+          if (selected && directTags.some((item) => item.epc === selected.epc)) {
+            lastDirectSeenAt = Date.now();
+          }
+          if (tag) {
+            if (!selected) selectEpc(tag);
+            else if (tag.epc !== selected.epc) {
+              if (Date.now() < holdUntil) queued = tag;
+              else { queued = null; selectEpc(tag); }
+            }
+          } else if (queued) {
+            queued = null;
+          }
+          if (queued && Date.now() >= holdUntil) {
+            const next = queued;
+            queued = null;
+            selectEpc(next);
+          }
+          if (selected && !queued && Date.now() >= holdUntil
+              && Date.now() - lastDirectSeenAt >= 10_000) {
+            clearSelection();
+          }
+          await updateChallenge();
+        } catch (_) {
+          if (!selected) setWaiting("수신기 PC 서버에 연결할 수 없습니다.");
+        } finally {
+          window.setTimeout(poll, 600);
+        }
+      }
+      poll();
+    })();
+  </script>
+</body>
 </html>

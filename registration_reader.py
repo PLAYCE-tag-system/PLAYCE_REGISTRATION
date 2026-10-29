@@ -1,142 +1,122 @@
+import json
 import os
+import re
+import socket
 import time
-
-import serial
-from dotenv import load_dotenv
-
-from http_client import delete_json, get_json, post_json
-from rfid_serial import RegistrationSerialReader, normalize_port, print_available_ports
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(BASE_DIR, ".env"))
-
-REGISTRATION_API_BASE = os.getenv("REGISTRATION_API_BASE", "http://127.0.0.1:4300").rstrip("/")
-REGISTRATION_SITE_ID = os.getenv("REGISTRATION_SITE_ID", "suwon_01")
-REGISTRATION_READER_ID = os.getenv("REGISTRATION_READER_ID", "rp_001")
-REGISTRATION_CLAIM_BASE_URL = os.getenv(
-    "REGISTRATION_CLAIM_BASE_URL",
-    "khuround://tag-bindings/claim",
-)
+ROOT = Path(__file__).resolve().parent
+EPC_RE = re.compile(r"^(?:[0-9A-F]{2}){1,32}$")
+DEVICE_RE = re.compile(r"^playce-[0-9a-f]{6}$")
 
 
-class RegistrationReader(RegistrationSerialReader):
-    def on_tag(self, epc):
-        create_registration_challenge(epc)
+def load_local_env():
+    env_path = ROOT / ".env"
+    if not env_path.exists():
+        return
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip().strip("\"'")
+        if key and key not in os.environ:
+            os.environ[key] = value
 
 
-def create_registration_challenge(epc):
-    challenge_data = {
-        "siteId": REGISTRATION_SITE_ID,
-        "readerId": REGISTRATION_READER_ID,
-        "epc": epc,
-        "claimBaseUrl": REGISTRATION_CLAIM_BASE_URL,
-    }
+load_local_env()
+API_BASE = os.getenv("REGISTRATION_API_BASE", "http://playce-admin.mooo.com:4300").rstrip("/")
+SITE_ID = os.getenv("REGISTRATION_SITE_ID", "suwon_01")
+READER_ID = os.getenv("REGISTRATION_READER_ID", "rp_001")
+CLAIM_BASE_URL = os.getenv("REGISTRATION_CLAIM_BASE_URL", "playce://tag-bindings/claim")
+TOKEN = os.getenv("REGISTRATION_INTERNAL_API_TOKEN", "").strip()
+TOKEN_HEADER = os.getenv("REGISTRATION_INTERNAL_API_TOKEN_HEADER", "Authorization").strip()
+TOKEN_SCHEME = os.getenv("REGISTRATION_INTERNAL_API_TOKEN_SCHEME", "Bearer").strip()
+HOST = os.getenv("REGISTRATION_UDP_HOST", "0.0.0.0")
+PORT = int(os.getenv("REGISTRATION_UDP_PORT", "8767"))
+GATEWAY_ID = os.getenv("REGISTRATION_GATEWAY_ID", "").strip().lower()
+RESEND_INTERVAL_SECONDS = max(1.0, float(os.getenv("REGISTRATION_RESEND_INTERVAL_SECONDS", "60")))
+last_checked = {}
 
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            print(f"Sending registration QR challenge... EPC={epc}")
-            payload = post_json(
-                REGISTRATION_API_BASE,
-                "/internal/registration-challenges",
-                challenge_data,
-            )
-            print(f"QR challenge created: {payload['challengeId']}")
+
+def refresh_api_token():
+    """Pick up a token pasted into .env while this listener is already running."""
+    env_path = ROOT / ".env"
+    if not env_path.exists():
+        return TOKEN
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if line.startswith("REGISTRATION_INTERNAL_API_TOKEN="):
+            return line.split("=", 1)[1].strip().strip("\"'")
+    return TOKEN
+
+
+def request_json(path, method="GET", payload=None, authenticated=False):
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Accept": "application/json"}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    if authenticated and TOKEN:
+        headers[TOKEN_HEADER] = f"{TOKEN_SCHEME} {TOKEN}" if TOKEN_SCHEME else TOKEN
+    request = Request(API_BASE + path, data=data, headers=headers, method=method)
+    with urlopen(request, timeout=8) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def issue_or_reuse(epc, gateway):
+    global TOKEN
+    TOKEN = refresh_api_token()
+    pending = request_json("/v1/registration-challenges/pending").get("challenges", [])
+    for challenge in pending:
+        if str(challenge.get("epc", "")).upper() == epc:
+            print(f"Existing EPC-bound challenge reused: EPC={epc}", flush=True)
             return
-        except Exception as error:
-            print(f"Challenge request failed ({attempt + 1}/{max_retries}): {error}")
-            if attempt < max_retries - 1:
-                time.sleep(2)
-            else:
-                print(f"Final challenge request failed. EPC={epc}")
-
-
-def clear_current_scan_collection():
-    try:
-        print("Clearing pending registration challenges...")
-        pending = get_json(REGISTRATION_API_BASE, "/v1/registration-challenges/pending").get(
-            "challenges",
-            [],
-        )
-        for challenge in pending:
-            delete_json(
-                REGISTRATION_API_BASE,
-                f"/internal/registration-challenges/{challenge['challengeId']}",
-            )
-        print(f"Pending challenge cleanup complete: {len(pending)} removed.")
-    except Exception as error:
-        print(f"Pending challenge cleanup failed: {error}")
+    if not TOKEN:
+        print("Registration token missing: set REGISTRATION_INTERNAL_API_TOKEN in .env", flush=True)
+        return
+    payload = {
+        "siteId": SITE_ID,
+        "readerId": READER_ID,
+        "epc": epc,
+        "claimBaseUrl": CLAIM_BASE_URL,
+    }
+    response = request_json("/internal/registration-challenges", "POST", payload, authenticated=True)
+    print(f"Challenge created: EPC={epc} challengeId={response.get('challengeId', '?')}", flush=True)
 
 
 def main():
-    print(f"Registration backend: {REGISTRATION_API_BASE}")
-    print(f"Registration reader: site={REGISTRATION_SITE_ID}, reader={REGISTRATION_READER_ID}")
-
-    if read_bool_env("REGISTRATION_CLEAR_PENDING_ON_START", True):
-        clear_current_scan_collection()
-
-    port = os.getenv("REGISTRATION_SERIAL_PORT")
-    if not port:
-        print_available_ports()
-        port = input("Registration reader serial port (example: /dev/ttyUSB0, COM8, or 8): ")
-    port = normalize_port(port)
-
-    source_mode = os.getenv("REGISTRATION_SOURCE_MODE", "esp32")
-    print(f"Selected port: {port}")
-    print(f"Source mode: {source_mode}")
-
-    try:
-        reader = RegistrationReader(
-            port=port,
-            baudrate=read_int_env("REGISTRATION_BAUDRATE", 115200),
-            source_mode=source_mode,
-            resend_interval_seconds=read_float_env("REGISTRATION_RESEND_INTERVAL_SECONDS", 60.0),
-            startup_wait_seconds=read_float_env("REGISTRATION_STARTUP_WAIT_SECONDS", 2.0),
-            command_retry_seconds=read_float_env("REGISTRATION_COMMAND_RETRY_SECONDS", 3.0),
-            debug=read_bool_env("REGISTRATION_DEBUG", False),
-        )
-    except serial.SerialException as error:
-        print(f"Could not open serial port: {error}")
-        return
-
-    try:
-        reader.read_forever()
-    except serial.SerialException as error:
-        print(f"Serial error: {error}")
-    except KeyboardInterrupt:
-        print("Stopped by user.")
-    finally:
-        reader.close()
-
-
-def read_int_env(name, default):
-    value = os.getenv(name)
-    if not value:
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        print(f"{name} is not an integer. Using {default}.")
-        return default
-
-
-def read_float_env(name, default):
-    value = os.getenv(name)
-    if not value:
-        return default
-    try:
-        return float(value)
-    except ValueError:
-        print(f"{name} is not a number. Using {default}.")
-        return default
-
-
-def read_bool_env(name, default):
-    value = os.getenv(name)
-    if not value:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+    print(f"Listening for direct UHF tag events on UDP {HOST}:{PORT}", flush=True)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind((HOST, PORT))
+        while True:
+            raw, address = listener.recvfrom(4096)
+            try:
+                message = json.loads(raw.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if message.get("v") != 1 or message.get("event") != "seen":
+                continue
+            epc = str(message.get("epc", "")).upper()
+            device = str(message.get("device", "")).lower()
+            gateway = str(message.get("gateway", "")).lower()
+            if (not EPC_RE.fullmatch(epc) or message.get("tag_source") != "direct_uhf"
+                    or not DEVICE_RE.fullmatch(device) or device != gateway):
+                continue
+            if GATEWAY_ID and gateway != GATEWAY_ID:
+                continue
+            now = time.monotonic()
+            if now - last_checked.get(epc, 0) < RESEND_INTERVAL_SECONDS:
+                continue
+            last_checked[epc] = now
+            try:
+                print(f"Direct tag EPC={epc} receiver={gateway} from={address}", flush=True)
+                issue_or_reuse(epc, gateway)
+            except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, OSError) as error:
+                print(f"Challenge request failed for EPC={epc}: {error}", flush=True)
 
 
 if __name__ == "__main__":
